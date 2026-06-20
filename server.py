@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-Protégé MCP Server
-==================
-一个为 Protégé/OWL 本体提供 MCP（Model Context Protocol）接口的服务器。
+OWL MCP Server
+==============
+为 OWL/TTL/RDF 本体提供 MCP（Model Context Protocol）接口。
 支持加载本体、SPARQL 查询、添加类/属性/个体、运行推理器等操作。
 
-依赖: pip install mcp owlready2
+依赖: pip install mcp owlready2 rdflib
 运行: python server.py
 """
 
+import io
 import json
 import sys
-import io
+import tempfile
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
 try:
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import (
-        Tool,
-        TextContent,
-        CallToolResult,
-    )
+    from mcp.types import CallToolResult, TextContent, Tool
 except ImportError:
     print("❌ 缺少 mcp 包，请运行: pip install mcp", file=sys.stderr)
     sys.exit(1)
@@ -31,37 +30,156 @@ except ImportError:
 try:
     import owlready2
     from owlready2 import (
-        get_ontology,
         World,
-        sync_reasoner_pellet,
-        sync_reasoner_hermit,
         default_world,
+        get_ontology,
+        sync_reasoner_hermit,
+        sync_reasoner_pellet,
     )
 except ImportError:
-    print("ERROR: owlready2 not installed. Run: pip install owlready2", file=sys.stderr)
+    print("❌ 缺少 owlready2 包，请运行: pip install owlready2", file=sys.stderr)
     sys.exit(1)
 
 try:
     import rdflib
     from rdflib import URIRef
+    from rdflib.namespace import OWL, RDF, RDFS, XSD
 except ImportError:
-    print("ERROR: rdflib not installed. Run: pip install rdflib", file=sys.stderr)
+    print("❌ 缺少 rdflib 包，请运行: pip install rdflib", file=sys.stderr)
     sys.exit(1)
 
-# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # 全局状态
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 _world: Optional[World] = None
 _onto: Optional[Any] = None
-_graph: Optional[Any] = None  # rdflib.Graph, 用于 SPARQL 和兜底查询
+_graph: Optional[rdflib.Graph] = None   # rdflib 图，用于 SPARQL 及兜底查询
 _loaded_path: Optional[str] = None
 
 app = Server("owl-mcp")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 辅助函数
+# ─────────────────────────────────────────────────────────────
+def _check_loaded() -> None:
+    """确认本体已加载，否则抛出友好错误。"""
+    if _onto is None:
+        raise RuntimeError("尚未加载本体，请先调用 load_ontology 工具。")
+
+
+def _local_name(iri: str) -> str:
+    """从 IRI 提取 local name。"""
+    return iri.split("#")[-1] if "#" in iri else iri.split("/")[-1]
+
+
+def _find_class(name: str) -> Optional[Any]:
+    """在已加载本体中按 local name 查找类。"""
+    _check_loaded()
+    # 优先精确匹配 IRI 后缀
+    cls = _onto.search_one(iri=f"*#{name}") or _onto.search_one(iri=f"*/{name}")
+    if cls is None:
+        for c in _onto.classes():
+            if c.name == name:
+                return c
+    return cls
+
+
+def _find_individual(name: str) -> Optional[Any]:
+    """在已加载本体中按 local name 查找个体。"""
+    _check_loaded()
+    for ind in _onto.individuals():
+        if ind.name == name:
+            return ind
+    return None
+
+
+def _find_property(name: str) -> Optional[Any]:
+    """在已加载本体中按 local name 查找属性（对象属性或数据属性）。"""
+    _check_loaded()
+    for prop in list(_onto.object_properties()) + list(_onto.data_properties()):
+        if prop.name == name:
+            return prop
+    return None
+
+
+def _safe_str(val: Any) -> str:
+    try:
+        return str(val)
+    except Exception:
+        return repr(val)
+
+
+def _xsd_range_label(r: Any) -> str:
+    """将 owlready2 数据属性的 range 转为可读 XSD 类型名。"""
+    s = str(r)
+    # owlready2 返回 Python 类型，如 <class 'str'>、<class 'float'>
+    mapping = {
+        "<class 'str'>": "xsd:string",
+        "<class 'int'>": "xsd:integer",
+        "<class 'float'>": "xsd:decimal",
+        "<class 'bool'>": "xsd:boolean",
+        "<class 'datetime.datetime'>": "xsd:dateTime",
+        "<class 'datetime.date'>": "xsd:date",
+    }
+    return mapping.get(s, s)
+
+
+def _sync_graph_from_onto() -> None:
+    """
+    将 owlready2 内存模型同步回 _graph（rdflib）。
+    用于 add_class / add_individual 之后，确保后续 SPARQL 查询和 turtle 保存都能
+    看到最新改动。
+    """
+    global _graph
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".owl", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        _onto.save(file=tmp_path, format="rdfxml")
+        _graph = rdflib.Graph()
+        _graph.parse(tmp_path, format="xml")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _load_ontology_from_bytes(world: World, iri: str, data: bytes) -> Any:
+    """
+    用给定的 RDF/XML bytes 加载本体到 world，同时拦截网络请求以避免尝试
+    下载远程 owl:imports。
+    """
+    orig = urllib.request.urlopen
+
+    def _block_network(url_or_req, *args, **kwargs):
+        raise urllib.error.URLError("Network access disabled during ontology load")
+
+    urllib.request.urlopen = _block_network
+    try:
+        onto = world.get_ontology(iri).load(
+            fileobj=io.BytesIO(data), reload=True
+        )
+    finally:
+        urllib.request.urlopen = orig
+    return onto
+
+
+def _prepare_graph_for_owlready2(g: rdflib.Graph) -> bytes:
+    """
+    预处理 rdflib 图：
+    1. 补全 owl:NamedIndividual 声明（让 owlready2 正确识别个体）
+    2. 移除 owl:imports（避免加载时尝试下载远程本体）
+    3. 序列化为 RDF/XML bytes
+    """
+    for s, p, o in list(g.triples((None, RDF.type, None))):
+        if isinstance(o, URIRef) and (o, RDF.type, OWL.Class) in g:
+            g.add((s, RDF.type, OWL.NamedIndividual))
+    g.remove((None, OWL.imports, None))
+    return g.serialize(format="xml").encode("utf-8")
+
+
+# ─────────────────────────────────────────────────────────────
 # 工具列表
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @app.list_tools()
 async def list_tools():
     return [
@@ -171,7 +289,7 @@ async def list_tools():
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "完整的 SPARQL SELECT 查询语句",
+                        "description": "完整的 SPARQL 1.1 SELECT 查询语句",
                     },
                     "limit": {
                         "type": "integer",
@@ -184,7 +302,7 @@ async def list_tools():
         ),
         Tool(
             name="add_class",
-            description="向本体添加一个新类，可指定父类。",
+            description="向本体添加一个新类，可指定父类、标签和注释。修改不会自动保存，需调用 save_ontology。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -195,17 +313,14 @@ async def list_tools():
                         "default": "Thing",
                     },
                     "label": {"type": "string", "description": "可选：rdfs:label 标签"},
-                    "comment": {
-                        "type": "string",
-                        "description": "可选：rdfs:comment 注释",
-                    },
+                    "comment": {"type": "string", "description": "可选：rdfs:comment 注释"},
                 },
                 "required": ["class_name"],
             },
         ),
         Tool(
             name="add_individual",
-            description="向本体添加一个新个体，并指定所属类。",
+            description="向本体添加一个新个体，并指定所属类。修改不会自动保存，需调用 save_ontology。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -219,7 +334,7 @@ async def list_tools():
                     },
                     "properties": {
                         "type": "object",
-                        "description": "可选：属性键值对，如 {\"amount\": 100.0, \"currency\": \"CNY\"}",
+                        "description": '可选：初始属性键值对，如 {"amount": 100.0, "currency": "CNY"}',
                     },
                 },
                 "required": ["individual_name", "class_name"],
@@ -227,15 +342,12 @@ async def list_tools():
         ),
         Tool(
             name="add_object_property_assertion",
-            description="为个体添加对象属性断言（individual1 --prop--> individual2）。",
+            description="为个体添加对象属性断言（subject --property--> object）。修改不会自动保存，需调用 save_ontology。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "subject": {"type": "string", "description": "主体个体 local name"},
-                    "property": {
-                        "type": "string",
-                        "description": "对象属性 local name",
-                    },
+                    "property": {"type": "string", "description": "对象属性 local name"},
                     "object": {"type": "string", "description": "客体个体 local name"},
                 },
                 "required": ["subject", "property", "object"],
@@ -243,7 +355,7 @@ async def list_tools():
         ),
         Tool(
             name="run_reasoner",
-            description="运行推理器（Pellet 或 HermiT）对本体进行推理，检查一致性并推断隐含知识。",
+            description="运行推理器（Pellet 或 HermiT）对本体进行推理，检查一致性并推断隐含知识。需要本机安装 JDK 8+。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -258,7 +370,7 @@ async def list_tools():
         ),
         Tool(
             name="save_ontology",
-            description="将当前本体保存到文件（覆盖原文件或指定新路径）。",
+            description="将当前本体（含所有未保存的修改）保存到文件。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -268,7 +380,7 @@ async def list_tools():
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["rdfxml", "ntriples", "turtle"],
+                        "enum": ["rdfxml", "turtle", "ntriples"],
                         "description": "序列化格式，默认 rdfxml",
                         "default": "rdfxml",
                     },
@@ -277,7 +389,7 @@ async def list_tools():
         ),
         Tool(
             name="search_entity",
-            description="按名称关键词搜索类、个体、属性（模糊匹配）。",
+            description="按名称关键词搜索类、个体、属性（大小写不敏感模糊匹配）。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -297,273 +409,121 @@ async def list_tools():
     ]
 
 
-# ─────────────────────────────────────────────
-# 辅助函数
-# ─────────────────────────────────────────────
-def _check_loaded():
-    if _onto is None:
-        raise RuntimeError("❌ 尚未加载本体。请先调用 load_ontology 工具。")
-
-
-def _find_class(name: str):
-    _check_loaded()
-    # 先尝试直接查找
-    cls = _onto.search_one(iri=f"*#{name}") or _onto.search_one(iri=f"*/{name}")
-    if cls is None:
-        # 遍历所有类
-        for c in _onto.classes():
-            if c.name == name:
-                return c
-    return cls
-
-
-def _find_individual(name: str):
-    _check_loaded()
-    for ind in _onto.individuals():
-        if ind.name == name:
-            return ind
-    return None
-
-
-def _find_property(name: str):
-    _check_loaded()
-    for prop in list(_onto.object_properties()) + list(_onto.data_properties()):
-        if prop.name == name:
-            return prop
-    return None
-
-
-def _safe_str(val):
-    try:
-        return str(val)
-    except Exception:
-        return repr(val)
-
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 工具实现
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> CallToolResult:
     global _world, _onto, _loaded_path, _graph
 
+    def ok(data: Any) -> CallToolResult:
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2))]
+        )
+
     try:
-        # ── load_ontology ──────────────────────────────────
+        # ── load_ontology ──────────────────────────────────────────
         if name == "load_ontology":
             path = arguments["path"]
             _world = World()
 
-            # 支持本地路径
             local = Path(path)
             if local.exists():
-                file_uri = local.resolve().as_uri()
                 ext = local.suffix.lower()
-
-                # 始终用 rdflib 解析（用于 SPARQL 和兜底查询）
-                rdflib_format = {
-                    ".ttl": "turtle",
-                    ".turtle": "turtle",
+                rdflib_fmt = {
+                    ".ttl": "turtle", ".turtle": "turtle",
                     ".n3": "n3",
-                    ".jsonld": "json-ld",
-                    ".json": "json-ld",
-                    ".owl": "xml",
-                    ".rdf": "xml",
-                    ".xml": "xml",
-                    ".nt": "nt",
-                    ".ntriples": "nt",
+                    ".jsonld": "json-ld", ".json": "json-ld",
+                    ".owl": "xml", ".rdf": "xml", ".xml": "xml",
+                    ".nt": "nt", ".ntriples": "nt",
                 }.get(ext, "xml")
 
                 _graph = rdflib.Graph()
-                _graph.parse(str(local.resolve()), format=rdflib_format)
-
-                # 补全 owl:NamedIndividual 声明，让 owlready2 能正确识别个体
-                from rdflib.namespace import RDF, RDFS, OWL
-                for s, p, o in list(_graph.triples((None, RDF.type, None))):
-                    if isinstance(o, URIRef) and (o, RDF.type, OWL.Class) in _graph:
-                        _graph.add((s, RDF.type, OWL.NamedIndividual))
-
-                # 移除无法访问的 owl:imports，避免 owlready2 尝试下载远程本体失败
-                from rdflib.namespace import RDF, RDFS, OWL
-                _graph.remove((None, OWL.imports, None))
-
-                # 用 rdflib 转 RDF/XML 再喂给 owlready2
-                rdfxml_data = _graph.serialize(format="xml").encode("utf-8")
-
-                # Monkey-patch owlready2 的 import 下载行为，跳过无法访问的远程 import
-                _orig_urlopen = None
-                def _mock_urlopen_no_network(url_or_req, *args, **kwargs):
-                    """拦截 owlready2 的远程 import 下载请求，直接抛出异常让 owlready2 忽略"""
-                    raise urllib.error.URLError("Network access disabled for import resolution")
-                import urllib.request
-                _orig_urlopen = urllib.request.urlopen
-                urllib.request.urlopen = _mock_urlopen_no_network
-
-                try:
-                    _onto = _world.get_ontology(file_uri).load(
-                        fileobj=io.BytesIO(rdfxml_data),
-                        reload=True
-                    )
-                finally:
-                    # 恢复原始 urlopen
-                    urllib.request.urlopen = _orig_urlopen
-
+                _graph.parse(str(local.resolve()), format=rdflib_fmt)
+                rdfxml_data = _prepare_graph_for_owlready2(_graph)
+                _onto = _load_ontology_from_bytes(_world, local.resolve().as_uri(), rdfxml_data)
                 _loaded_path = str(local.resolve())
             else:
                 # 远程 IRI
                 _graph = rdflib.Graph()
                 _graph.parse(path)
-                from rdflib.namespace import RDF, RDFS, OWL
-                for s, p, o in list(_graph.triples((None, RDF.type, None))):
-                    if isinstance(o, URIRef) and (o, RDF.type, OWL.Class) in _graph:
-                        _graph.add((s, RDF.type, OWL.NamedIndividual))
-                # 移除无法访问的 owl:imports
-                _graph.remove((None, OWL.imports, None))
-                rdfxml_data = _graph.serialize(format="xml").encode("utf-8")
-
-                import urllib.request
-                _orig_urlopen = urllib.request.urlopen
-                urllib.request.urlopen = _mock_urlopen_no_network
-                try:
-                    _onto = _world.get_ontology(path).load(
-                        fileobj=io.BytesIO(rdfxml_data),
-                        reload=True
-                    )
-                finally:
-                    urllib.request.urlopen = _orig_urlopen
+                rdfxml_data = _prepare_graph_for_owlready2(_graph)
+                _onto = _load_ontology_from_bytes(_world, path, rdfxml_data)
                 _loaded_path = path
 
-            classes_n = sum(1 for _ in _onto.classes())
-            inds_n = sum(1 for _ in _onto.individuals())
-            props_n = sum(1 for _ in _onto.object_properties()) + sum(
-                1 for _ in _onto.data_properties()
-            )
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "status": "ok",
-                                "iri": str(_onto.base_iri),
-                                "classes": classes_n,
-                                "individuals": inds_n,
-                                "properties": props_n,
-                                "loaded_from": _loaded_path,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            return ok({
+                "status": "ok",
+                "iri": str(_onto.base_iri),
+                "classes": sum(1 for _ in _onto.classes()),
+                "individuals": sum(1 for _ in _onto.individuals()),
+                "properties": sum(1 for _ in _onto.object_properties()) + sum(1 for _ in _onto.data_properties()),
+                "loaded_from": _loaded_path,
+            })
 
-        # ── get_ontology_info ──────────────────────────────
+        # ── get_ontology_info ──────────────────────────────────────
         elif name == "get_ontology_info":
             _check_loaded()
-            classes_n = sum(1 for _ in _onto.classes())
-            # 用 rdflib 图统计个体（更可靠）
-            inds_n = len(
-                list(
-                    _graph.query(
-                        """
-                        SELECT DISTINCT ?ind WHERE {
-                            ?ind a ?type .
-                            ?type a owl:Class .
-                            FILTER(?type != owl:Class)
-                        }
-                        """
-                    )
-                )
-            ) if _graph else sum(1 for _ in _onto.individuals())
-            obj_props = sum(1 for _ in _onto.object_properties())
-            data_props = sum(1 for _ in _onto.data_properties())
-            ann_props = sum(1 for _ in _onto.annotation_properties())
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "iri": str(_onto.base_iri),
-                                "loaded_from": _loaded_path,
-                                "classes": classes_n,
-                                "individuals": inds_n,
-                                "object_properties": obj_props,
-                                "data_properties": data_props,
-                                "annotation_properties": ann_props,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            # 用 rdflib 统计个体（更可靠，包含只有 rdf:type 没有 owl:NamedIndividual 的情况）
+            _IND_SPARQL = """
+                PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                SELECT DISTINCT ?ind WHERE {
+                    ?ind a ?type .
+                    ?type a owl:Class .
+                    FILTER(?type != owl:Class)
+                }
+            """
+            if _graph:
+                inds_n = sum(1 for _ in _graph.query(_IND_SPARQL))
+            else:
+                inds_n = sum(1 for _ in _onto.individuals())
 
-        # ── list_classes ────────────────────────────────────
+            return ok({
+                "iri": str(_onto.base_iri),
+                "loaded_from": _loaded_path,
+                "classes": sum(1 for _ in _onto.classes()),
+                "individuals": inds_n,
+                "object_properties": sum(1 for _ in _onto.object_properties()),
+                "data_properties": sum(1 for _ in _onto.data_properties()),
+                "annotation_properties": sum(1 for _ in _onto.annotation_properties()),
+            })
+
+        # ── list_classes ───────────────────────────────────────────
         elif name == "list_classes":
             _check_loaded()
             prefix = arguments.get("prefix", "").lower()
-            limit = arguments.get("limit", 100)
+            limit = int(arguments.get("limit", 100))
             results = []
             for cls in _onto.classes():
                 if prefix and not cls.name.lower().startswith(prefix):
                     continue
-                results.append(
-                    {
-                        "name": cls.name,
-                        "iri": str(cls.iri),
-                        "label": str(cls.label.first()) if cls.label else None,
-                    }
-                )
+                results.append({
+                    "name": cls.name,
+                    "iri": str(cls.iri),
+                    "label": str(cls.label.first()) if cls.label else None,
+                })
                 if len(results) >= limit:
                     break
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"total_shown": len(results), "classes": results},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            return ok({"total_shown": len(results), "classes": results})
 
-        # ── list_individuals ────────────────────────────────
+        # ── list_individuals ───────────────────────────────────────
         elif name == "list_individuals":
             _check_loaded()
             class_name = arguments.get("class_name")
-            limit = arguments.get("limit", 100)
+            limit = int(arguments.get("limit", 100))
             results = []
 
             if _graph:
-                # 用 rdflib SPARQL 查询个体（更可靠）
                 if class_name:
-                    # 查找该类及其子类的个体
-                    sparql = """
-                        PREFIX owl: <http://www.w3.org/2002/07/owl#>
-                        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-                        SELECT DISTINCT ?ind ?indType WHERE {
-                            ?ind a ?indType .
-                            ?indType a owl:Class .
-                            ?indType rdfs:subClassOf* ?targetClass .
-                            FILTER(?indType != owl:Class)
-                        }
-                    """
                     cls = _find_class(class_name)
                     if cls is None:
-                        # 也可能在 rdflib 图里找
                         raise ValueError(f"类 '{class_name}' 不存在")
-                    target_iri = str(cls.iri)
-                    # 直接查该类的实例
-                    sparql = """
-                        SELECT DISTINCT ?ind ?indType WHERE {
-                            ?ind a <%s> .
-                            OPTIONAL { ?ind a ?indType . ?indType a owl:Class . }
-                        }
-                    """ % target_iri
-                    rows = list(_graph.query(sparql))
+                    sparql = f"""
+                        PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                        SELECT DISTINCT ?ind ?indType WHERE {{
+                            ?ind a <{cls.iri}> .
+                            OPTIONAL {{ ?ind a ?indType . ?indType a owl:Class . }}
+                        }}
+                    """
                 else:
                     sparql = """
                         PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -573,207 +533,125 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                             FILTER(?type != owl:Class)
                         }
                     """
-                    rows = list(_graph.query(sparql))
-
                 seen = set()
-                for row in rows:
+                for row in _graph.query(sparql):
                     ind_iri = str(row[0])
                     if ind_iri in seen:
                         continue
                     seen.add(ind_iri)
-                    local_name = ind_iri.split("#")[-1] if "#" in ind_iri else ind_iri.split("/")[-1]
-                    types = []
+                    entry = {"name": _local_name(ind_iri), "iri": ind_iri, "types": []}
                     if len(row) > 1 and row[1] is not None:
-                        type_iri = str(row[1])
-                        types.append(type_iri.split("#")[-1] if "#" in type_iri else type_iri.split("/")[-1])
-                    results.append({"name": local_name, "iri": ind_iri, "types": types})
+                        entry["types"].append(_local_name(str(row[1])))
+                    results.append(entry)
                     if len(results) >= limit:
                         break
             else:
-                source = _onto.individuals()
-                if class_name:
-                    cls = _find_class(class_name)
-                    if cls is None:
-                        raise ValueError(f"类 '{class_name}' 不存在")
-                    source = cls.instances()
+                source = cls.instances() if class_name and (cls := _find_class(class_name)) else _onto.individuals()
                 for ind in source:
-                    results.append(
-                        {
-                            "name": ind.name,
-                            "iri": str(ind.iri),
-                            "types": [str(t.name) for t in ind.is_a if hasattr(t, "name")],
-                        }
-                    )
+                    results.append({
+                        "name": ind.name,
+                        "iri": str(ind.iri),
+                        "types": [t.name for t in ind.is_a if hasattr(t, "name")],
+                    })
                     if len(results) >= limit:
                         break
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"total_shown": len(results), "individuals": results},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
 
-        # ── list_properties ─────────────────────────────────
+            return ok({"total_shown": len(results), "individuals": results})
+
+        # ── list_properties ────────────────────────────────────────
         elif name == "list_properties":
             _check_loaded()
             prop_type = arguments.get("prop_type", "all")
             results = []
             if prop_type in ("object", "all"):
                 for p in _onto.object_properties():
-                    results.append(
-                        {
-                            "name": p.name,
-                            "type": "ObjectProperty",
-                            "domain": [d.name for d in p.domain if hasattr(d, "name")],
-                            "range": [r.name for r in p.range if hasattr(r, "name")],
-                        }
-                    )
+                    results.append({
+                        "name": p.name,
+                        "type": "ObjectProperty",
+                        "domain": [d.name for d in p.domain if hasattr(d, "name")],
+                        "range": [r.name for r in p.range if hasattr(r, "name")],
+                    })
             if prop_type in ("data", "all"):
                 for p in _onto.data_properties():
-                    results.append(
-                        {
-                            "name": p.name,
-                            "type": "DataProperty",
-                            "domain": [d.name for d in p.domain if hasattr(d, "name")],
-                            "range": [_safe_str(r) for r in p.range],
-                        }
-                    )
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"total_shown": len(results), "properties": results},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+                    results.append({
+                        "name": p.name,
+                        "type": "DataProperty",
+                        "domain": [d.name for d in p.domain if hasattr(d, "name")],
+                        # FIX: 将 <class 'float'> 等转换为可读的 xsd: 类型名
+                        "range": [_xsd_range_label(r) for r in p.range],
+                    })
+            return ok({"total_shown": len(results), "properties": results})
 
-        # ── describe_class ───────────────────────────────────
+        # ── describe_class ─────────────────────────────────────────
         elif name == "describe_class":
             _check_loaded()
             cls = _find_class(arguments["class_name"])
             if cls is None:
                 raise ValueError(f"类 '{arguments['class_name']}' 不存在")
 
-            parents = [p.name for p in cls.is_a if hasattr(p, "name")]
-            children = [c.name for c in cls.subclasses()]
-            equivalents = [
-                e.name for e in cls.equivalent_to if hasattr(e, "name")
-            ]
-            instances = [i.name for i in cls.instances()][:50]
-            restrictions = [
-                _safe_str(r) for r in cls.is_a if not hasattr(r, "name")
-            ]
+            return ok({
+                "name": cls.name,
+                "iri": str(cls.iri),
+                "label": str(cls.label.first()) if cls.label else None,
+                "comment": str(cls.comment.first()) if cls.comment else None,
+                "parents": [p.name for p in cls.is_a if hasattr(p, "name")],
+                "children": [c.name for c in cls.subclasses()],
+                "equivalent_to": [e.name for e in cls.equivalent_to if hasattr(e, "name")],
+                "restrictions": [_safe_str(r) for r in cls.is_a if not hasattr(r, "name")],
+                "instances_count": sum(1 for _ in cls.instances()),
+                "instances_sample": [i.name for i in cls.instances()][:50],
+            })
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "name": cls.name,
-                                "iri": str(cls.iri),
-                                "label": str(cls.label.first()) if cls.label else None,
-                                "comment": str(cls.comment.first())
-                                if cls.comment
-                                else None,
-                                "parents": parents,
-                                "children": children,
-                                "equivalent_to": equivalents,
-                                "restrictions": restrictions,
-                                "instances_count": sum(1 for _ in cls.instances()),
-                                "instances_sample": instances,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
-
-        # ── describe_individual ──────────────────────────────
+        # ── describe_individual ────────────────────────────────────
         elif name == "describe_individual":
             _check_loaded()
             ind_name = arguments["individual_name"]
-            ind = _find_individual(ind_name)
-
-            if ind is None and _graph:
-                # 用 rdflib 图查找
-                sparql = """
-                    PREFIX owl: <http://www.w3.org/2002/07/owl#>
-                    SELECT DISTINCT ?ind ?iri WHERE {
-                        ?ind a ?type .
-                        ?type a owl:Class .
-                        FILTER(?type != owl:Class)
-                    }
-                """
-                for row in _graph.query(sparql):
-                    iri_str = str(row[0])
-                    local = iri_str.split("#")[-1] if "#" in iri_str else iri_str.split("/")[-1]
-                    if local == ind_name:
-                        ind = {"name": local, "iri": iri_str}
-                        break
-
-            if ind is None:
-                raise ValueError(f"个体 '{ind_name}' 不存在")
-
-            ind_iri = str(ind.iri) if hasattr(ind, "iri") else ind["iri"]
 
             if _graph:
-                # 用 rdflib 图获取所有属性值（最可靠）
-                types_sparql = """
-                    SELECT DISTINCT ?type WHERE {
-                        <%s> a ?type .
+                # 在 rdflib 图中查找个体 IRI
+                find_sparql = f"""
+                    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                    SELECT DISTINCT ?ind WHERE {{
+                        ?ind a ?type .
                         ?type a owl:Class .
-                    }
-                """ % ind_iri
-                types = []
-                for row in _graph.query(types_sparql):
-                    type_iri = str(row[0])
-                    types.append(type_iri.split("#")[-1] if "#" in type_iri else type_iri.split("/")[-1])
+                        FILTER(STRENDS(STR(?ind), "#{ind_name}") || STRENDS(STR(?ind), "/{ind_name}"))
+                    }}
+                """
+                ind_iri = None
+                for row in _graph.query(find_sparql):
+                    ind_iri = str(row[0])
+                    break
 
-                props_sparql = """
-                    SELECT ?pred ?obj WHERE {
-                        <%s> ?pred ?obj .
-                        FILTER(?pred != rdf:type)
-                    }
-                """ % ind_iri
-                props = {}
+                if ind_iri is None:
+                    raise ValueError(f"个体 '{ind_name}' 不存在")
+
+                types_sparql = f"""
+                    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                    SELECT DISTINCT ?type WHERE {{
+                        <{ind_iri}> a ?type .
+                        ?type a owl:Class .
+                    }}
+                """
+                types = [_local_name(str(row[0])) for row in _graph.query(types_sparql)]
+
+                props_sparql = f"""
+                    SELECT ?pred ?obj WHERE {{
+                        <{ind_iri}> ?pred ?obj .
+                        FILTER(?pred != <{RDF.type}>)
+                    }}
+                """
+                props: dict = {}
                 for row in _graph.query(props_sparql):
-                    pred_iri = str(row[0])
-                    pred_name = pred_iri.split("#")[-1] if "#" in pred_iri else pred_iri.split("/")[-1]
-                    obj_val = str(row[1])
-                    if pred_name not in props:
-                        props[pred_name] = []
-                    props[pred_name].append(obj_val)
+                    pred_name = _local_name(str(row[0]))
+                    obj_val = _local_name(str(row[1])) if isinstance(row[1], URIRef) else str(row[1])
+                    props.setdefault(pred_name, []).append(obj_val)
 
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "name": ind_name,
-                                    "iri": ind_iri,
-                                    "types": types,
-                                    "properties": props,
-                                },
-                                ensure_ascii=False,
-                                indent=2,
-                            ),
-                        )
-                    ]
-                )
+                return ok({"name": ind_name, "iri": ind_iri, "types": types, "properties": props})
+
             else:
+                ind = _find_individual(ind_name)
+                if ind is None:
+                    raise ValueError(f"个体 '{ind_name}' 不存在")
                 types = [t.name for t in ind.is_a if hasattr(t, "name")]
                 props = {}
                 for prop in _onto.object_properties():
@@ -790,64 +668,26 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                     vals = getattr(ind, prop.name, [])
                     if vals:
                         try:
-                            props[prop.name] = (
-                                list(vals) if hasattr(vals, "__iter__") else [vals]
-                            )
+                            props[prop.name] = list(vals) if hasattr(vals, "__iter__") else [vals]
                         except Exception:
                             pass
+                return ok({"name": ind.name, "iri": str(ind.iri), "types": types, "properties": props})
 
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "name": ind.name,
-                                    "iri": str(ind.iri),
-                                    "types": types,
-                                    "properties": props,
-                                },
-                                ensure_ascii=False,
-                                indent=2,
-                            ),
-                        )
-                    ]
-                )
-
-        # ── sparql_query ─────────────────────────────────────
+        # ── sparql_query ───────────────────────────────────────────
         elif name == "sparql_query":
             _check_loaded()
             query = arguments["query"]
-            limit = arguments.get("limit", 50)
+            limit = int(arguments.get("limit", 50))
 
-            if _graph:
-                rows = []
-                for row in _graph.query(query):
-                    rows.append([_safe_str(cell) for cell in row])
-                    if len(rows) >= limit:
-                        break
-            else:
-                graph = _world.as_rdflib_graph()
-                rows = []
-                for row in graph.query(query):
-                    rows.append([_safe_str(cell) for cell in row])
-                    if len(rows) >= limit:
-                        break
+            graph = _graph if _graph else _world.as_rdflib_graph()
+            rows = []
+            for row in graph.query(query):
+                rows.append([_safe_str(cell) for cell in row])
+                if len(rows) >= limit:
+                    break
+            return ok({"total_shown": len(rows), "results": rows})
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"total_shown": len(rows), "results": rows},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
-
-        # ── add_class ────────────────────────────────────────
+        # ── add_class ──────────────────────────────────────────────
         elif name == "add_class":
             _check_loaded()
             cls_name = arguments["class_name"]
@@ -855,13 +695,9 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             label = arguments.get("label")
             comment = arguments.get("comment")
 
-            # 找父类
-            if parent_name == "Thing":
-                parent = owlready2.Thing
-            else:
-                parent = _find_class(parent_name)
-                if parent is None:
-                    raise ValueError(f"父类 '{parent_name}' 不存在")
+            parent = owlready2.Thing if parent_name == "Thing" else _find_class(parent_name)
+            if parent is None:
+                raise ValueError(f"父类 '{parent_name}' 不存在")
 
             with _onto:
                 new_cls = type(cls_name, (parent,), {"namespace": _onto})
@@ -870,25 +706,17 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 if comment:
                     new_cls.comment = [comment]
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "status": "ok",
-                                "created": cls_name,
-                                "iri": str(new_cls.iri),
-                                "parent": parent_name,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            # FIX: 将 owlready2 的改动同步回 _graph，确保后续 SPARQL 和 turtle 保存正确
+            _sync_graph_from_onto()
 
-        # ── add_individual ────────────────────────────────────
+            return ok({
+                "status": "ok",
+                "created": cls_name,
+                "iri": str(new_cls.iri),
+                "parent": parent_name,
+            })
+
+        # ── add_individual ─────────────────────────────────────────
         elif name == "add_individual":
             _check_loaded()
             ind_name = arguments["individual_name"]
@@ -906,26 +734,18 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                     if prop:
                         setattr(ind, k, v)
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "status": "ok",
-                                "created": ind_name,
-                                "iri": str(ind.iri),
-                                "type": cls_name,
-                                "properties_set": list(extra_props.keys()),
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            # FIX: 同步改动到 _graph
+            _sync_graph_from_onto()
 
-        # ── add_object_property_assertion ─────────────────────
+            return ok({
+                "status": "ok",
+                "created": ind_name,
+                "iri": str(ind.iri),
+                "type": cls_name,
+                "properties_set": list(extra_props.keys()),
+            })
+
+        # ── add_object_property_assertion ──────────────────────────
         elif name == "add_object_property_assertion":
             _check_loaded()
             subj_name = arguments["subject"]
@@ -949,25 +769,18 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 else:
                     setattr(subj, prop_name, [obj])
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "status": "ok",
-                                "triple": f"{subj_name} --{prop_name}--> {obj_name}",
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-                ]
-            )
+            # FIX: 同步改动到 _graph
+            _sync_graph_from_onto()
 
-        # ── run_reasoner ──────────────────────────────────────
+            return ok({"status": "ok", "triple": f"{subj_name} --{prop_name}--> {obj_name}"})
+
+        # ── run_reasoner ───────────────────────────────────────────
         elif name == "run_reasoner":
             _check_loaded()
             reasoner = arguments.get("reasoner", "hermit")
+
+            classes_before = sum(1 for _ in _onto.classes())
+            inds_before = sum(1 for _ in _onto.individuals())
 
             with _onto:
                 if reasoner == "pellet":
@@ -975,28 +788,23 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 else:
                     sync_reasoner_hermit(infer_property_values=True)
 
-            classes_n = sum(1 for _ in _onto.classes())
-            inds_n = sum(1 for _ in _onto.individuals())
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "status": "ok",
-                                "reasoner": reasoner,
-                                "message": "推理完成，本体一致性验证通过",
-                                "classes_after": classes_n,
-                                "individuals_after": inds_n,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            classes_after = sum(1 for _ in _onto.classes())
+            inds_after = sum(1 for _ in _onto.individuals())
 
-        # ── save_ontology ─────────────────────────────────────
+            return ok({
+                "status": "ok",
+                "reasoner": reasoner,
+                "message": "推理完成，本体一致性验证通过",
+                "classes_before": classes_before,
+                "classes_after": classes_after,
+                "individuals_before": inds_before,
+                "individuals_after": inds_after,
+                # FIX: 返回推断出的新增数量，让 AI 知道推断了什么
+                "inferred_classes": classes_after - classes_before,
+                "inferred_individuals": inds_after - inds_before,
+            })
+
+        # ── save_ontology ──────────────────────────────────────────
         elif name == "save_ontology":
             _check_loaded()
             out_path = arguments.get("path") or _loaded_path
@@ -1006,15 +814,11 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 raise ValueError("无法确定保存路径，请指定 path 参数")
 
             if fmt == "turtle":
-                # 用 rdflib 图直接保存为 Turtle
+                # FIX: 使用已同步的 _graph（含最新改动）保存 turtle
                 if _graph:
                     _graph.serialize(destination=out_path, format="turtle")
                 else:
-                    # 回退：owlready2 存为 RDF/XML 再转
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb", suffix=".owl", delete=False
-                    ) as tmp:
+                    with tempfile.NamedTemporaryFile(mode="wb", suffix=".owl", delete=False) as tmp:
                         _onto.save(file=tmp.name, format="rdfxml")
                         g = rdflib.Graph()
                         g.parse(tmp.name, format="xml")
@@ -1026,37 +830,28 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 else:
                     _onto.save(file=out_path, format="ntriples")
             else:
-                # rdfxml
+                # rdfxml：通过 owlready2 保存，再同步回 _graph
                 _onto.save(file=out_path, format="rdfxml")
-                # 同步更新 rdflib 图
                 _graph = rdflib.Graph()
                 _graph.parse(out_path, format="xml")
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {"status": "ok", "saved_to": out_path, "format": fmt},
-                            ensure_ascii=False,
-                        ),
-                    )
-                ]
-            )
 
-        # ── search_entity ─────────────────────────────────────
+            return ok({"status": "ok", "saved_to": out_path, "format": fmt})
+
+        # ── search_entity ──────────────────────────────────────────
         elif name == "search_entity":
             _check_loaded()
             kw = arguments["keyword"].lower()
-            limit = arguments.get("limit", 30)
+            limit = int(arguments.get("limit", 30))
             results = []
 
             for cls in _onto.classes():
                 if kw in cls.name.lower():
                     results.append({"type": "Class", "name": cls.name, "iri": str(cls.iri)})
 
-            if _graph:
-                # 用 rdflib 图搜索个体
-                sparql = """
+            # 用 rdflib 图搜索个体（比 owlready2 更可靠）
+            ind_source = _graph if _graph else None
+            if ind_source:
+                ind_sparql = """
                     PREFIX owl: <http://www.w3.org/2002/07/owl#>
                     SELECT DISTINCT ?ind WHERE {
                         ?ind a ?type .
@@ -1065,67 +860,46 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                     }
                 """
                 seen = set()
-                for row in _graph.query(sparql):
+                for row in ind_source.query(ind_sparql):
                     iri_str = str(row[0])
                     if iri_str in seen:
                         continue
                     seen.add(iri_str)
-                    local = iri_str.split("#")[-1] if "#" in iri_str else iri_str.split("/")[-1]
+                    local = _local_name(iri_str)
                     if kw in local.lower():
                         results.append({"type": "Individual", "name": local, "iri": iri_str})
             else:
                 for ind in _onto.individuals():
                     if kw in ind.name.lower():
-                        results.append(
-                            {"type": "Individual", "name": ind.name, "iri": str(ind.iri)}
-                        )
+                        results.append({"type": "Individual", "name": ind.name, "iri": str(ind.iri)})
 
             for p in list(_onto.object_properties()) + list(_onto.data_properties()):
                 if kw in p.name.lower():
-                    results.append(
-                        {"type": "Property", "name": p.name, "iri": str(p.iri)}
-                    )
+                    results.append({"type": "Property", "name": p.name, "iri": str(p.iri)})
 
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "keyword": arguments["keyword"],
-                                "total_found": len(results),
-                                "results": results[:limit],
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-                ]
-            )
+            return ok({
+                "keyword": arguments["keyword"],
+                "total_found": len(results),
+                "results": results[:limit],
+            })
 
         else:
             raise ValueError(f"未知工具: {name}")
 
     except Exception as e:
-        tb = traceback.format_exc()
         return CallToolResult(
             isError=True,
-            content=[
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {"error": str(e), "traceback": tb},
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                )
-            ],
+            content=[TextContent(
+                type="text",
+                text=json.dumps({"error": str(e), "traceback": traceback.format_exc()},
+                                ensure_ascii=False, indent=2),
+            )],
         )
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 入口
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 async def main():
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
@@ -1133,5 +907,4 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-
     asyncio.run(main())
