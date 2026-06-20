@@ -1,0 +1,48 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix : <http://example.org/test#> .
+
+<http://example.org/test> a owl:Ontology ;
+    rdfs:label "Test Ontology" .
+
+# Classes
+:Person a owl:Class ;
+    rdfs:label "Person" ;
+    rdfs:comment "A person entity" .
+
+:Employee a owl:Class ;
+    rdfs:subClassOf :Person ;
+    rdfs:label "Employee" .
+
+:BankStatement a owl:Class ;
+    rdfs:label "Bank Statement" ;
+    rdfs:comment "A bank statement record" .
+
+# Object Properties
+:hasStatement a owl:ObjectProperty ;
+    rdfs:domain :Person ;
+    rdfs:range :BankStatement ;
+    rdfs:label "has statement" .
+
+# Data Properties
+:amount a owl:DatatypeProperty ;
+    rdfs:domain :BankStatement ;
+    rdfs:range xsd:decimal ;
+    rdfs:label "amount" .
+
+:employeeId a owl:DatatypeProperty ;
+    rdfs:domain :Employee ;
+    rdfs:range xsd:string ;
+    rdfs:label "employee ID" .
+
+# Individuals
+:alice a :Employee ;
+    rdfs:label "Alice" ;
+    :employeeId "E001" ;
+    :hasStatement :stmt1 .
+
+:stmt1 a :BankStatement ;
+    :amount "1500.00"^^xsd:decimal ;
+    rdfs:label "Statement 1" .
