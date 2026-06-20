@@ -1,6 +1,6 @@
-# Protégé MCP Server
+# OWL MCP Server
 
-一个为 Protégé / OWL 本体提供 **MCP（Model Context Protocol）** 接口的服务器。
+一个为 OWL 本体提供 **MCP（Model Context Protocol）** 接口的服务器。
 让 AI（WorkBuddy / Claude / Cursor 等）能直接操作 `.ttl` / `.owl` / `.rdf` 本体文件。
 
 ---
@@ -47,9 +47,9 @@ pip install -r requirements.txt
 ```json
 {
   "mcpServers": {
-    "protege": {
+    "owl": {
       "command": "python",
-      "args": ["D:/mywork/protege-mcp/server.py"]
+      "args": ["path to /server.py"]
     }
   }
 }
@@ -62,7 +62,7 @@ pip install -r requirements.txt
 
 ### 3. 在 WorkBuddy 中启用
 
-打开连接器管理页面（右上角），找到 `protege` MCP，点击 **Trust** 启用。
+打开连接器管理页面（右上角），找到 `owl` MCP，点击 **Trust** 启用。
 
 ### 4. 开始使用
 
