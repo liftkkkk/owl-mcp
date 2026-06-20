@@ -56,7 +56,7 @@ _onto: Optional[Any] = None
 _graph: Optional[Any] = None  # rdflib.Graph, 用于 SPARQL 和兜底查询
 _loaded_path: Optional[str] = None
 
-app = Server("protege-mcp")
+app = Server("owl-mcp")
 
 
 # ─────────────────────────────────────────────
